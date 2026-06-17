@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<!-- standalone：自包含單檔（solar-lunar + 5 資料表 + 引擎全部內聯，零外部相依，可離線雙擊執行）。 -->
+<!-- standalone：自包含單檔（零外部相依，可離線雙擊執行）。 -->
 <title>小六太乙 · 八字命盤工具</title>
 <style>
 :root {
@@ -369,7 +369,10 @@ button {
   <div class="btn-row">
     <button class="btn-primary" onclick="runChart()">排盤</button>
     <button class="btn-ghost" onclick="fillExample()">範例</button>
+    <button class="btn-ghost" onclick="document.getElementById('load-file').click()">讀取檔案</button>
   </div>
+  <!-- 隱藏的檔案輸入（讀取存檔的 .json）。放在靜態區，不會被重新排盤覆蓋。 -->
+  <input type="file" id="load-file" accept=".json,application/json" style="display:none" onchange="loadChartFile(event)">
 </div>
 
 <div id="result">
@@ -2864,16 +2867,15 @@ function renderChart(chart) {
       <div id="layers-result" style="margin-top:10px"></div>
     </details>
 
-    <h2>匯出 JSON（給 Skill 用）</h2>
-    <textarea id="json-output" readonly></textarea>
+    <h2>命盤存檔</h2>
+    <p class="note">「存檔」會把這張命盤（含細盤與動態層）下載成 .json；日後用「讀取檔案」載回即可重排，命書 Skill 也吃同一份檔。</p>
     <div class="btn-row">
-      <button class="btn-primary" onclick="copyJson()">複製 JSON</button>
-      <button class="btn-ghost" onclick="downloadJson()">下載 .json</button>
+      <button class="btn-primary" onclick="downloadJson()">存檔</button>
+      <button class="btn-ghost" onclick="document.getElementById('load-file').click()">讀取檔案</button>
     </div>
   `;
 
   document.getElementById('result').innerHTML = html;
-  updateJsonOutput();
   queryGrid(); // 預設以今天為基準排細盤
 }
 
@@ -3086,25 +3088,47 @@ function updateJsonOutput() {
   }
 }
 
-function copyJson() {
-  const out = document.getElementById('json-output');
-  out.focus();
-  out.select();
-  out.setSelectionRange(0, out.value.length); // 行動裝置也能選取
-  // 後備：file:// 下 navigator.clipboard 可能受限，改用 execCommand
-  function fallbackCopy() {
+// 讀取存檔的 .json，還原命盤並重排（含細盤與動態層）
+function loadChartFile(event) {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function (e) {
+    let data;
     try {
-      const ok = document.execCommand('copy');
-      alert(ok ? 'JSON 已複製' : '請手動長按／Ctrl+C 複製選取的文字');
-    } catch (e) {
-      alert('請手動長按／Ctrl+C 複製選取的文字');
+      data = JSON.parse(e.target.result);
+    } catch (err) {
+      alert('讀取失敗：不是有效的 JSON 檔。');
+      event.target.value = '';
+      return;
     }
-  }
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(out.value).then(() => alert('JSON 已複製')).catch(fallbackCopy);
-  } else {
-    fallbackCopy();
-  }
+    if (!data || !data.pillars || !data.meta) {
+      alert('讀取失敗：這份 JSON 不是本工具的命盤存檔。');
+      event.target.value = '';
+      return;
+    }
+    // 還原上方表單欄位
+    const m = data.meta || {};
+    document.getElementById('in-name').value = (m.name && m.name !== '未命名') ? m.name : '';
+    if (m.gender) document.getElementById('in-gender').value = m.gender;
+    if (m.solarBirth) {
+      document.getElementById('in-year').value = m.solarBirth.year || '';
+      document.getElementById('in-month').value = m.solarBirth.month || '';
+      document.getElementById('in-day').value = m.solarBirth.day || '';
+      if (m.solarBirth.hour != null) document.getElementById('in-hour').value = String(m.solarBirth.hour);
+    }
+    // 直接以存檔內容渲染（renderChart 內部會呼叫 queryGrid 重排細盤＋動態層）
+    try {
+      currentChart = data;
+      renderChart(currentChart);
+      event.target.value = ''; // 清空輸入，讓同一檔可再次讀取
+      alert('已讀取命盤：' + (m.name || '未命名'));
+    } catch (err2) {
+      alert('讀取失敗：命盤資料不完整或格式不符。\n' + err2.message);
+      event.target.value = '';
+    }
+  };
+  reader.readAsText(file);
 }
 
 function downloadJson() {
