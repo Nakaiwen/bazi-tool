@@ -337,7 +337,7 @@ button {
     </div>
     <div class="field">
       <label>國曆年</label>
-      <input type="number" id="in-year" placeholder="1988" min="1900" max="2100">
+      <input type="number" id="in-year" placeholder="1988" min="1930" max="2050" title="節氣資料範圍 1930–2050">
     </div>
     <div class="field">
       <label>月</label>
@@ -1516,8 +1516,20 @@ button {
      * @param {number} hour 24 小時制（0-23）
      * @returns {Object} { yearPillar, monthPillar, dayPillar, hourPillar, lunarInfo }
      */
+    /**
+     * 節氣資料防護（M2）：solar-lunar 的精確節氣表僅涵蓋 1930–2050。
+     * 超出範圍時 getTerm 回 0，年/月柱會「默默排錯」（如 1920 年柱差一年、月柱空白；
+     * 2060 月柱恆為子月）。此處以資料探測（非寫死範圍）擋下，拋明確錯誤。
+     */
+    function _assertTermData(sl, year, what) {
+        if (typeof sl.getTerm === 'function' && !sl.getTerm(year, 3)) {
+            throw new Error('西元 ' + year + ' 年超出節氣資料範圍（1930–2050），無法準確排' + (what || '盤') + '。');
+        }
+    }
+
     function calculateFourPillars(year, month, day, hour) {
         const sl = _getSolarLunar();
+        _assertTermData(sl, year, '盤');
         const lunar = sl.solar2lunar(year, month, day, hour);
 
         // 標準化讀取干支：同時支援兩種函式庫
@@ -1526,6 +1538,11 @@ button {
         const yearPillar = _readGanZhi(lunar, 'year');
         const monthPillar = _readGanZhi(lunar, 'month');
         const dayPillar = _readGanZhi(lunar, 'day');
+
+        // 跨年邊界（如 1930 年 1 月小寒前需 1929 年節氣）資料不足時，月柱會是空字串
+        if (!monthPillar) {
+            throw new Error('該日期落在節氣資料邊界（需要前一年的節氣資料），無法排月柱。');
+        }
 
         // 時柱：優先用函式庫的（若有 getTimeInGanZhi），否則用五鼠遁自算
         let hourPillar;
@@ -1590,6 +1607,7 @@ button {
      */
     function getAnnualPillar(targetYear) {
         const sl = _getSolarLunar();
+        _assertTermData(sl, targetYear, '流年');
         const lunar = sl.solar2lunar(targetYear, 3, 1);
         return _readGanZhi(lunar, 'year');
     }
@@ -1602,8 +1620,11 @@ button {
      */
     function getMonthlyPillar(year, month, day) {
         const sl = _getSolarLunar();
+        _assertTermData(sl, year, '流月');
         const lunar = sl.solar2lunar(year, month, day || 15);
-        return _readGanZhi(lunar, 'month');
+        const gz = _readGanZhi(lunar, 'month');
+        if (!gz) throw new Error('該日期落在節氣資料邊界，無法排流月。');
+        return gz;
     }
 
     /**
@@ -2160,30 +2181,39 @@ button {
                 relations.push({ kind: '三合', name: s.name, involved: s.involved, complete: s.complete, grade: s.grade, transformsTo: s.transformsTo, verdict: v, reason: `${s.involved.join('')}${s.grade}化${s.transformsTo}（${_yongHit(yongShen, s.transformsTo)}神）` });
                 if (v === '吉') { jiCount++; favEls.push(s.transformsTo); } else if (v === '凶') { xiongCount++; unfavEls.push(s.transformsTo); }
             });
-            (grp.pairs || []).forEach(pr => {
-                if (pr.a !== tBranch && pr.b !== tBranch) return;
-                const other = (pr.a === tBranch) ? pr.b : pr.a;
-                if (pr.type === '六合') {
-                    const v = _verdictByTransform(yongShen, pr.transformsTo);
-                    relations.push({ kind: '六合', pair: pr.pair, transformsTo: pr.transformsTo, verdict: v, reason: `${pr.pair}六合化${pr.transformsTo}（${_yongHit(yongShen, pr.transformsTo)}神）` });
-                    if (v === '吉') { jiCount++; favEls.push(pr.transformsTo); } else if (v === '凶') { xiongCount++; unfavEls.push(pr.transformsTo); }
-                } else { // 破 / 害
-                    const affEl = getElementOf(other);
-                    const v = _verdictByAfflict(yongShen, affEl);
-                    const info = (pr.type === '破') ? REL.PO : REL.HAI;
-                    relations.push({ kind: pr.type, pair: pr.pair, affected: other, affectedElement: affEl, verdict: v, reason: `${pr.type}動${other}(${affEl}·${_yongHit(yongShen, affEl)}神)`, gentleReminder: info && info.gentleReminder });
-                    if (v === '吉') jiCount++; else if (v === '凶') xiongCount++;
-                }
-            });
             (grp.xing || []).forEach(x => {
                 if (!involves(x.involved)) return;
                 // 刑為「痛苦的修正」，吉凶依流派，這裡標中性並帶養生提醒
                 relations.push({ kind: '刑', name: x.type, involved: x.involved, complete: x.complete, verdict: '中', reason: `${x.involved.join('')}${x.type}${x.complete ? '' : '（半刑）'}`, gentleReminder: x.info && x.info.gentleReminder });
             });
-            // 暗合（檯面下牽引）
-            origBranches.forEach((ob, i) => {
-                const ah = REL.detectAnHe(tBranch, ob);
-                if (ah) relations.push({ kind: '暗合', pair: ah.pair, with: origPos[i].role + '支', verdict: '中', reason: `與${origPos[i].role}支${ob}暗合（${ah.links.join('、')}）`, gentleReminder: ah.gentleReminder });
+
+            // —— 成對關係（六合/破/害/暗合）：以「流曜支 × 每個原局支」逐一查表（lookupPair）。
+            //    不用 grp.pairs 過濾——同字支時（流曜支與某原局支同字）字元比對會把
+            //    原局內部的關係誤歸給流曜、且同一關係重複計數（M1 修正）。
+            //    刑不在此處理：交由上方群體偵測（含三刑/半刑/自刑），避免重複。——
+            origPos.forEach(o => {
+                const lp = REL.lookupPair(tBranch, o.branch);
+                if (!lp) return;
+                if (lp.liuhe) {
+                    const v = _verdictByTransform(yongShen, lp.liuhe.transformsTo);
+                    relations.push({ kind: '六合', pair: lp.pair, with: o.role + '支', transformsTo: lp.liuhe.transformsTo, verdict: v, reason: `與${o.role}支${o.branch}六合化${lp.liuhe.transformsTo}（${_yongHit(yongShen, lp.liuhe.transformsTo)}神）`, gentleReminder: lp.liuhe.gentleReminder });
+                    if (v === '吉') { jiCount++; favEls.push(lp.liuhe.transformsTo); } else if (v === '凶') { xiongCount++; unfavEls.push(lp.liuhe.transformsTo); }
+                }
+                if (lp.po) {
+                    const affEl = getElementOf(o.branch);
+                    const v = _verdictByAfflict(yongShen, affEl);
+                    relations.push({ kind: '破', pair: lp.po.pair, with: o.role + '支', affected: o.branch, affectedElement: affEl, verdict: v, reason: `破動${o.role}支${o.branch}(${affEl}·${_yongHit(yongShen, affEl)}神)`, gentleReminder: lp.po.gentleReminder });
+                    if (v === '吉') jiCount++; else if (v === '凶') xiongCount++;
+                }
+                if (lp.hai) {
+                    const affEl = getElementOf(o.branch);
+                    const v = _verdictByAfflict(yongShen, affEl);
+                    relations.push({ kind: '害', pair: lp.hai.pair, with: o.role + '支', affected: o.branch, affectedElement: affEl, verdict: v, reason: `害動${o.role}支${o.branch}(${affEl}·${_yongHit(yongShen, affEl)}神)`, gentleReminder: lp.hai.gentleReminder });
+                    if (v === '吉') jiCount++; else if (v === '凶') xiongCount++;
+                }
+                if (lp.anhe) {
+                    relations.push({ kind: '暗合', pair: lp.anhe.pair, with: o.role + '支', verdict: '中', reason: `與${o.role}支${o.branch}暗合（${lp.anhe.links.join('、')}）`, gentleReminder: lp.anhe.gentleReminder });
+                }
             });
         }
 
@@ -2238,7 +2268,7 @@ button {
         const monthlyGZ = getMonthlyPillar(qY, qM, qD);
         const dailyGZ = getDailyPillar(qY, qM, qD);
         const cycle = getLuckCycle(chart.meta.solarBirth, (chart.meta && chart.meta.gender) || '男', p.yearPillar.charAt(0), p.monthPillar);
-        const curLuck = getCurrentLuckPillar(cycle, chart.meta.solarBirth, qY, qM, qD);
+        const curLuck = cycle.dataMissing ? null : getCurrentLuckPillar(cycle, chart.meta.solarBirth, qY, qM, qD);
         const daYunGZ = curLuck ? curLuck.pillar : null;
 
         const layers = {
@@ -2517,7 +2547,10 @@ button {
                 .filter(t => t < birthMs);
             candidates.sort((a, b) => b - a);
         }
-        if (!candidates.length) return { startAge: 0, days: 0 };
+        if (!candidates.length) {
+            // 節氣資料不足（如 2050 年末順排需 2051 年節氣）→ 明確標記，勿默默回 0 歲（M2）
+            return { startAge: 0, days: 0, dataMissing: true };
+        }
         const days = Math.abs(candidates[0] - birthMs) / 86400000;
         return { startAge: days / 3, days: days };
     }
@@ -2546,7 +2579,7 @@ button {
                 startAge: startInfo.startAge + (k - 1) * 10
             });
         }
-        return { forward: forward, startAge: startInfo.startAge, startDays: startInfo.days, pillars: pillars };
+        return { forward: forward, startAge: startInfo.startAge, startDays: startInfo.days, dataMissing: !!startInfo.dataMissing, pillars: pillars };
     }
 
     // 以查詢日期計算虛歲（實足年齡，用來定位當前大運）
@@ -2642,7 +2675,7 @@ button {
         // 大運
         const birth = chart.meta.solarBirth;
         const cycle = getLuckCycle(birth, ctx.gender, p.yearPillar.charAt(0), p.monthPillar);
-        const curLuck = getCurrentLuckPillar(cycle, birth, qY, qM, qD);
+        const curLuck = cycle.dataMissing ? null : getCurrentLuckPillar(cycle, birth, qY, qM, qD);
         const daYunGZ = curLuck ? curLuck.pillar : null;
 
         function ageLabel(a) {
@@ -2655,7 +2688,7 @@ button {
             { role: '流日', sub: qY + '/' + qM + '/' + qD, cell: computePillarCell(dailyGZ, ctx, false), dynamic: true },
             { role: '流月', sub: '節氣月', cell: computePillarCell(monthlyGZ, ctx, false), dynamic: true },
             { role: '流年', sub: qY + '年', cell: computePillarCell(annualGZ, ctx, false), dynamic: true },
-            { role: '大運', sub: curLuck ? (ageLabel(curLuck.startAge) + '起') : '未起運', cell: computePillarCell(daYunGZ, ctx, false), dynamic: true },
+            { role: '大運', sub: curLuck ? (ageLabel(curLuck.startAge) + '起') : (cycle.dataMissing ? '節氣資料不足' : '未起運'), cell: computePillarCell(daYunGZ, ctx, false), dynamic: true },
             // 本命四柱：視覺由右至左為「年 月 日 時」（年柱最右），故左→右排為 時、日、月、年
             { role: '時柱', sub: '本命', cell: computePillarCell(p.hourPillar, ctx, false), dynamic: false },
             { role: '日柱', sub: '日主', cell: computePillarCell(p.dayPillar, ctx, true), dynamic: false, isDay: true },
@@ -2855,7 +2888,7 @@ function renderChart(chart) {
     <h2>細盤 · 大運 / 流年 / 流月 / 流日</h2>
     <div class="annual-input">
       <span style="color:var(--muted);font-size:0.85rem">查詢日期：</span>
-      <input type="number" id="q-year" placeholder="年" min="1900" max="2200" value="${new Date().getFullYear()}" style="width:80px">
+      <input type="number" id="q-year" placeholder="年" min="1930" max="2050" value="${new Date().getFullYear()}" style="width:80px" title="節氣資料範圍 1930–2050">
       <input type="number" id="q-month" placeholder="月" min="1" max="12" value="${new Date().getMonth()+1}" style="width:56px">
       <input type="number" id="q-day" placeholder="日" min="1" max="31" value="${new Date().getDate()}" style="width:56px">
       <button class="btn-ghost" onclick="queryGrid()">更新</button>
